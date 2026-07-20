@@ -1,5 +1,5 @@
 pattern_name: abnormalMorphologyOfPartOfCellularComponent
-pattern_iri: http://purl.obolibrary.org/obo/upheno/patterns-dev/abnormalMorphologyOfCellularComponent.yaml
+pattern_iri: http://purl.obolibrary.org/obo/upheno/patterns-dev/abnormalMorphologyOfPartOfCellularComponent.yaml
 description: "An abnormality in the morphology of a cellular component or any part of a cellular component, using this pattern abnormal synaptic vesicle morphology would be inferred to be a child of abnormal synapse morphology."
 
 contributors:
@@ -16,13 +16,13 @@ relations:
   has_part: BFO:0000051
 
 annotationProperties:
-  exact_synonym: oio:hasExactSynonym 
+  narrow_synonym: oio:hasNarrowSynonym 
 
 vars:
   cellular_component: "'cellular component'"
 
 name:
-  text: "abnormal morphology of %s"
+  text: "abnormal % morphology"
   vars:
    - cellular_component
 
@@ -30,7 +30,7 @@ annotations:
   - annotationProperty: narrow_synonym
     text: "abnormal shape of %s"
     vars:
-     - cellular_component     
+     - cellular_component    
 
 def:
   text: "Any structural anomaly of the %s."
