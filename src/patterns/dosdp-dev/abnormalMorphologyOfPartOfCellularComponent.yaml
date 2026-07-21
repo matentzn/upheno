@@ -22,7 +22,7 @@ vars:
   cellular_component: "'cellular component'"
 
 name:
-  text: "abnormal % morphology"
+  text: "abnormal %s morphology"
   vars:
    - cellular_component
 
