@@ -59,8 +59,33 @@ $(REPORTDIR)/upheno-associated-entities.csv: upheno.owl
 #	rm $(MAPPINGDIR)/upheno-oba.kgx_nodes.tsv
 #	touch $@
 
-$(MAPPINGDIR)/uberon.sssom.tsv: mirror/uberon.owl
-	if [ $(COMP) = true ] ; then $(ROBOT) sssom:xref-extract -i $< --mapping-file $@ --map-prefix-to-predicate "UBERON http://w3id.org/semapv/vocab/crossSpeciesExactMatch"; fi
+# Uberon publishes its cross-species mappings with every release, so we no longer need
+# the mirror to extract them. Refreshed like any remote resource: with MIR=false (CI,
+# prepare_release.sh) the committed file is used.
+UBERON_SSSOM_URL = https://github.com/obophenotype/uberon/releases/latest/download/uberon.sssom.tsv
+
+ifeq ($(MIR),true)
+$(MAPPINGDIR)/uberon.sssom.tsv: .FORCE
+	wget -nv $(UBERON_SSSOM_URL) -O $@.tmp && mv $@.tmp $@
+endif
+
+# External mapping sets (see $(MAPPINGDIR)/external/README.md): extra input to the grouping
+# pipeline and the harmonisation report. Each needs a download rule, refreshed with MIR=true;
+# otherwise the committed copy is used.
+EXTERNAL_MAPPINGS = mp-hp-mgi-lex
+EXTERNAL_MAPPING_FILES = $(foreach m,$(EXTERNAL_MAPPINGS),$(MAPPINGDIR)/external/$(m).sssom.tsv)
+
+# MGI's lexical MP-HP mappings (#1013), regenerated weekly by MGI.
+MGI_MP_HP_URL = https://raw.githubusercontent.com/mapping-commons/mh_mapping_initiative/master/mappings/mp_hp_mgi_lex.tsv
+
+ifeq ($(MIR),true)
+$(MAPPINGDIR)/external/mp-hp-mgi-lex.sssom.tsv: .FORCE
+	wget -nv $(MGI_MP_HP_URL) -O $@.tmp && mv $@.tmp $@
+endif
+
+# Hand-curated overrides (species term -> uPheno class), never written by the pipeline.
+# Applied last, both to the species-independent mappings and to the grouping step.
+MANUAL_OVERRIDES = $(MAPPINGDIR)/upheno-manual-overrides.sssom.tsv
 
 $(REPORTDIR)/%_phenotype_data.csv: $(MIRRORDIR)/%.owl $(SPARQLDIR)/%_phenotypes.sparql
 	$(ROBOT) query -f csv -i $< --query $(SPARQLDIR)/$*_phenotypes.sparql $@
@@ -85,11 +110,15 @@ $(MAPPINGDIR)/upheno-species-independent-eq.sssom.tsv $(MAPPINGDIR)/uberon.sssom
 		--output-file-tsv $(MAPPINGDIR)/upheno-species-independent-eq.sssom.tsv \
 		--output-file-owl $(MAPPINGDIR)/upheno-species-independent-eq.sssom.owl; fi
 
-$(MAPPINGDIR)/upheno-species-independent.sssom.tsv: $(MAPPINGDIR)/upheno-species-independent-eq.sssom.tsv $(MAPPINGDIR)/upheno-species-independent-manual.sssom.tsv
+$(MAPPINGDIR)/upheno-species-independent.sssom.tsv: $(MAPPINGDIR)/upheno-species-independent-eq.sssom.tsv $(MAPPINGDIR)/upheno-species-independent-manual.sssom.tsv $(MANUAL_OVERRIDES)
 	sssom parse $(MAPPINGDIR)/upheno-species-independent-manual.sssom.tsv -I tsv --metadata config/upheno-species-independent.sssom.yml -o $(TMPDIR)/upheno-species-independent-with-meta.sssom.tsv
 	sssom merge $(MAPPINGDIR)/upheno-species-independent-eq.sssom.tsv $(TMPDIR)/upheno-species-independent-with-meta.sssom.tsv  -o $(TMPDIR)/upheno-species-independent-merged.sssom.tsv
 	sssom invert $(TMPDIR)/upheno-species-independent-merged.sssom.tsv -o $(TMPDIR)/upheno-species-independent-inverted.sssom.tsv
-	sssom sort $(TMPDIR)/upheno-species-independent-inverted.sssom.tsv -o $@
+	sssom sort $(TMPDIR)/upheno-species-independent-inverted.sssom.tsv -o $(TMPDIR)/upheno-species-independent-sorted.sssom.tsv
+	python3 ../scripts/upheno_build.py apply-mapping-overrides \
+		--mapping $(TMPDIR)/upheno-species-independent-sorted.sssom.tsv \
+		--overrides $(MANUAL_OVERRIDES) \
+		--output $@
 
 $(MAPPINGDIR)/upheno-cross-species.sssom.tsv: $(TMPDIR)/upheno-species-lexical.csv $(TMPDIR)/upheno-mapping-logical.csv
 	mkdir -p $(TMPDIR)/cross-species/
@@ -117,11 +146,39 @@ custom_reports: $(REPORTDIR)/upheno-associated-entities.csv \
 $(TMPDIR)/upheno-subclasses.csv: #upheno.owl
 	$(ROBOT) query -f csv -i upheno.owl --query ../sparql/metadata.sparql $@
 
+# External matches are lexical and not reviewed routinely, so only label-to-label exact
+# matches are used (--all-exact-matches would add synonym matches, which are many-to-one).
+$(TMPDIR)/upheno-cross-species-for-groupings.sssom.tsv: $(MAPPINGDIR)/upheno-cross-species.sssom.tsv $(EXTERNAL_MAPPING_FILES)
+	python3 ../scripts/upheno_build.py add-cross-species-mappings \
+		--cross-species-mapping $(MAPPINGDIR)/upheno-cross-species.sssom.tsv \
+		$(foreach f,$(EXTERNAL_MAPPING_FILES),--extra-mapping $(f)) \
+		--label-matches-only \
+		--output $@
+
+# Harmonisation opportunities: exact cross-species pairs (ours and external) whose terms sit
+# under different uPheno classes, how their EQs differ, and external matches that contradict
+# our own lexical ones. Read it, then fix EQs upstream or curate $(MANUAL_OVERRIDES).
+$(REPORTDIR)/upheno-harmonisation-opportunities.tsv: $(MAPPINGDIR)/upheno-cross-species.sssom.tsv $(EXTERNAL_MAPPING_FILES) $(MAPPINGDIR)/upheno-species-independent.sssom.tsv | $(REPORTDIR)
+	python3 ../scripts/upheno_build.py report-harmonisation \
+		--cross-species-mapping $(MAPPINGDIR)/upheno-cross-species.sssom.tsv \
+		$(foreach f,$(EXTERNAL_MAPPING_FILES),--extra-mapping $(f)) \
+		--species-independent-mapping $(MAPPINGDIR)/upheno-species-independent.sssom.tsv \
+		--dosdp-data-directory $(PATTERNDIR)/data \
+		--patterns-directory $(PATTERNDIR)/dosdp-dev --patterns-directory $(PATTERNDIR)/dosdp-patterns-curated \
+		--labels-ontology $(IMPORTDIR)/merged_import.owl --labels-ontology $(PATTERNDIR)/definitions.owl \
+		--labels-ontology $(COMPONENTSDIR)/upheno-manual-curation.owl \
+		--label-matches-only \
+		--output $@
+
+.PHONY: harmonisation_report
+harmonisation_report: $(REPORTDIR)/upheno-harmonisation-opportunities.tsv
+
 # Generate grouping classes for cases where no EQ exists
 .PHONY: update_manual_alignments
-update_manual_alignments: $(TMPDIR)/upheno-subclasses.csv
+update_manual_alignments: $(TMPDIR)/upheno-subclasses.csv $(TMPDIR)/upheno-cross-species-for-groupings.sssom.tsv harmonisation_report
 	python3 ../scripts/upheno_build.py create-upheno-groupings \
-		--cross-species-mapping $(MAPPINGDIR)/upheno-cross-species.sssom.tsv \
+		--overrides $(MANUAL_OVERRIDES) \
+		--cross-species-mapping $(TMPDIR)/upheno-cross-species-for-groupings.sssom.tsv \
 		--species-independent-mapping $(MAPPINGDIR)/upheno-species-independent.sssom.tsv \
 		--upheno-subclasses $(TMPDIR)/upheno-subclasses.csv \
 		--start-id 7000000 \
@@ -269,9 +326,12 @@ $(COMPONENTSDIR)/upheno-mappings.owl: $(SRC) $(MAPPINGDIR)/upheno-species-indepe
 		annotate --ontology-iri $(ONTBASE)/$@ --version-iri $(ONTBASE)/releases/$(TODAY)/$@ \
 		convert -f ofn -o $@
 
-$(COMPONENTSDIR)/upheno-bridge.owl: $(SRC) $(MAPPINGDIR)/upheno-species-independent.sssom.owl
+# The query only reads crossSpeciesExactMatch annotations involving uPheno, which all come
+# from the mappings. Merging $(SRC) instead pulled in the whole import closure (OOM in CI
+# with the 2026-10 import) and read the mappings component from before it was rebuilt.
+$(COMPONENTSDIR)/upheno-bridge.owl: $(COMPONENTSDIR)/upheno-mappings.owl $(MAPPINGDIR)/upheno-species-independent.sssom.owl
 	$(ROBOT) merge \
-			-i $(SRC) \
+			-i $(COMPONENTSDIR)/upheno-mappings.owl \
 			-i $(MAPPINGDIR)/upheno-species-independent.sssom.owl \
 		query --query $(SPARQLDIR)/construct-upheno-bridge.sparql tmp/bridge.ttl
 	$(ROBOT) merge \
@@ -301,7 +361,7 @@ $(IMPORTDIR)/merged_terms_combined.txt: $(ALL_TERMS_COMBINED) $(IMPORTDIR)/all_p
 
 ALL_MIRRORS = $(patsubst %, $(MIRRORDIR)/%.owl, $(IMPORTS))
 ifeq ($(strip $(MERGE_MIRRORS)),true)
-$(MIRRORDIR)/merged.owl: $(ALL_MIRRORS)
+$(MIRRORDIR)/merged.owl: $(ALL_MIRRORS) | all_robot_plugins
 	$(ROBOT) merge $(patsubst %, -i %, $(ALL_MIRRORS)) \
 		upheno:extract-upheno-relations \
 			--root-phenotype UPHENO:0001001 \
@@ -376,12 +436,13 @@ full_patterns_pipeline:
 
 FILE_TO_OBSOLETE_URL="https://docs.google.com/spreadsheets/d/e/2PACX-1vQOEhF0ffls_ALgYT3eLazW2Cn0PdgEozGK7chOaS6Z3g28abWhmy-sz086Xl0c7A-fndEPAEKxPNjv/pub?gid=368192736&single=true&output=tsv"
 
+# Manually curated obsoletions (obsolete/replacement UPHENO CURIEs). The sheet is not used
+# right now, but obsolete-classes-from-tsvs needs the file with its header.
 tmp/to_obsolete.tsv:
 	#wget $(FILE_TO_OBSOLETE_URL) -O $@
-	touch $@
+	printf 'obsolete\treplacement\n' > $@
 
-obsolete_fillers:
-	#$(MAKE) $(REPORTDIR)/obsolete_filler_classes.tsv tmp/to_obsolete.tsv IMP=false MIR=false -B
+obsolete_fillers: $(REPORTDIR)/obsolete_filler_classes.tsv tmp/to_obsolete.tsv
 	python3 ../scripts/upheno_build.py obsolete-classes-from-tsvs \
 		--obsoleted-template ../templates/obsolete.tsv \
 		--obsolete-fillers-file $(REPORTDIR)/obsolete_filler_classes.tsv \
@@ -417,6 +478,22 @@ prepare_release_customised: all_odk
 .PHONY: prepare_release_fast
 prepare_release_fast:
 	$(MAKE) prepare_release_customised IMP=false PAT=false MIR=false COMP=false
+
+# CI downloads the merged import from the latest release instead of rebuilding it
+# (see .github/workflows/qc.yml), so every release has to ship it.
+RELEASE_ASSETS_AFTER_RELEASE += $(IMPORTDIR)/merged_import.owl.gz
+
+$(IMPORTDIR)/merged_import.owl.gz: .FORCE
+	test -f $(IMPORTDIR)/merged_import.owl
+	gzip -c $(IMPORTDIR)/merged_import.owl > $@
+
+public_release: $(IMPORTDIR)/merged_import.owl.gz
+
+# report_on is empty in upheno-odk.yaml so that CI does not spend an hour on a report
+# that never fails (fail_on: None). Releases still ship the report on upheno-base.owl.
+UPHENO_BASE_REPORT = $(REPORTDIR)/upheno-base.owl-obo-report.tsv
+RELEASE_ASSETS += $(UPHENO_BASE_REPORT)
+all_assets: $(UPHENO_BASE_REPORT)
 
 reports/validate_profile_owl2dl_upheno.owl.txt:
 	echo "SKIP $@"
@@ -512,6 +589,34 @@ mirror/uberon-bridge-to-caro.owl:
 	$(ROBOT) merge -i ../patterns/pattern.owl \
 	filter --select "<http://purl.obolibrary.org/obo/upheno/patterns*>" --select "self annotations" --signature true --trim true -o ../patterns/pattern-simple.owl
 
+# dosdp-tools takes filler labels from this ontology rather than $(EDIT_PREPROCESSED), so
+# ambiguous filler labels can be fixed in generated labels and definitions without
+# touching the filler itself in the release (#972). Overrides live in
+# $(TEMPLATEDIR)/dosdp-label-overrides.tsv: the filler's annotations are replaced by the
+# new label, with the old label kept as an exact synonym. Plain ROBOT, no SPARQL: loading
+# the preprocessed file into Jena runs out of memory in CI.
+DOSDP_LABEL_ONTOLOGY = $(TMPDIR)/upheno-preprocess-dosdp-labels.owl
+DOSDP_LABEL_OVERRIDES = $(TEMPLATEDIR)/dosdp-label-overrides.tsv
+
+$(TMPDIR)/dosdp-label-override-terms.txt: $(DOSDP_LABEL_OVERRIDES) | $(TMPDIR)
+	tail -n +3 $< | cut -f1 > $@
+
+$(DOSDP_LABEL_ONTOLOGY): $(EDIT_PREPROCESSED) $(DOSDP_LABEL_OVERRIDES) $(TMPDIR)/dosdp-label-override-terms.txt
+	$(ROBOT) remove -i $(EDIT_PREPROCESSED) --term-file $(TMPDIR)/dosdp-label-override-terms.txt \
+		--select self --axioms annotation --signature true \
+		template --template $(DOSDP_LABEL_OVERRIDES) --merge-after \
+		convert -f ofn -o $@
+
+$(DOSDP_OWL_FILES_DEFAULT): $(DOSDP_LABEL_ONTOLOGY) $(DOSDP_TSV_FILES_DEFAULT) $(ALL_PATTERN_FILES)
+	if [ "${DOSDP_PATTERN_NAMES_DEFAULT}" ]; then $(DOSDPT) generate --catalog=$(CATALOG) \
+    --infile=$(PATTERNDIR)/data/default/ --template=$(PATTERNDIR)/dosdp-patterns --batch-patterns="$(DOSDP_PATTERN_NAMES_DEFAULT)" \
+    --ontology=$(DOSDP_LABEL_ONTOLOGY) --obo-prefixes=true --outfile=$(PATTERNDIR)/data/default; fi
+
+$(DOSDP_OWL_FILES_AUTOMATIC): $(DOSDP_LABEL_ONTOLOGY) $(DOSDP_TSV_FILES_AUTOMATIC) $(ALL_PATTERN_FILES)
+	if [ "${DOSDP_PATTERN_NAMES_AUTOMATIC}" ]; then $(DOSDPT) generate --catalog=$(CATALOG) \
+    --infile=$(PATTERNDIR)/data/automatic --template=$(PATTERNDIR)/dosdp-patterns/ --batch-patterns="$(DOSDP_PATTERN_NAMES_AUTOMATIC)" \
+    --ontology=$(DOSDP_LABEL_ONTOLOGY) --obo-prefixes=true --outfile=$(PATTERNDIR)/data/automatic; fi
+
 ../patterns/dosdp-patterns/README.md: .FORCE
 	python ../scripts/patterns_create_overview.py "../patterns/dosdp-patterns|../patterns/dosdp-dev" $@
 
@@ -523,3 +628,21 @@ pattern_readmes: ../patterns/dosdp-patterns/README.md
 
 .PHONY: upheno_test
 test: $(TMPDIR)/pattern_schema_checks_dev ../patterns/pattern-simple.owl
+
+# The phenotype root check needs the inferred hierarchy: pattern classes only carry
+# equivalence axioms, so on the asserted edit file nearly every class fails (#1011).
+# reason_test keeps its reasoned output so the check does not reason a second time.
+EDIT_REASONED = $(TMPDIR)/$(ONT)-preprocess-reasoned.owl
+
+$(EDIT_REASONED): $(EDIT_PREPROCESSED)
+	$(ROBOT) reason --input $< --reasoner $(REASONER) --equivalent-classes-allowed all \
+		--exclude-tautologies structural --output $@
+
+reason_test: $(EDIT_REASONED)
+	echo "Reasoning $(EDIT_PREPROCESSED) succeeded."
+
+.PHONY: phenotype_root_test
+phenotype_root_test: $(EDIT_REASONED) | $(REPORTDIR)
+	$(ROBOT) verify -i $< --queries ../sparql/upheno-no-phenotype-root-violation.sparql -O $(REPORTDIR)
+
+test: phenotype_root_test
